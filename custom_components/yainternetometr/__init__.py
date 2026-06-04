@@ -5,7 +5,13 @@ import asyncio
 from asyncio import timeout
 from datetime import timedelta
 import logging
+import secrets
+import statistics
+import string
+import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -15,7 +21,17 @@ from yaspeedtest.client import YaSpeedTest
 
 _LOGGER = logging.getLogger(__name__)
 
-UPLOAD_CLASSIC_FALLBACK_SIZE = 1_000_000
+UPLOAD_CLASSIC_FALLBACK_SIZE = 3_000_000
+UPLOAD_BROWSERLIKE_CONCURRENCY = 32
+UPLOAD_BROWSERLIKE_REQUESTS = 320
+UPLOAD_BROWSERLIKE_MIN_SUCCESS_RATIO = 0.9
+DOWNLOAD_BROWSERLIKE_CONCURRENCY = 32
+DOWNLOAD_BROWSERLIKE_REQUESTS = 320
+DOWNLOAD_BROWSERLIKE_MIN_SUCCESS_RATIO = 0.9
+PING_BROWSERLIKE_CONCURRENCY = 16
+PING_BROWSERLIKE_REQUESTS = 80
+PING_BROWSERLIKE_MIN_SUCCESS_RATIO = 0.8
+_RID_ALPHABET = string.ascii_lowercase + string.digits
 
 
 def _normalize_rate_mbps(value: float | int | None, metric_name: str) -> float:
@@ -120,13 +136,34 @@ def _get_value(source: object, field_name: str, default: object = None) -> objec
     return getattr(source, field_name, default)
 
 
-async def _measure_upload_fallback_mbps(ya: YaSpeedTest) -> float:
-    """Measure upload directly from available upload probes."""
-    upload = _get_value(_get_value(ya, "probes"), "upload")
-    probes = _get_value(upload, "probes", []) or []
-    best_upload_mbps = 0.0
+def _generate_rid(length: int = 16) -> str:
+    """Generate a request id similar to the browser test."""
+    return "".join(secrets.choice(_RID_ALPHABET) for _ in range(length))
 
-    for probe_idx, probe in enumerate(probes, start=1):
+
+def _url_with_rid(url: str, rid: str) -> str:
+    """Add or replace the rid query parameter in a probe URL."""
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["rid"] = rid
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(query),
+            parts.fragment,
+        )
+    )
+
+
+def _upload_probes(ya: YaSpeedTest) -> list[tuple[int, str, int, object]]:
+    """Return upload probes normalized to index, URL, size, and timeout."""
+    upload = _get_value(_get_value(ya, "probes"), "upload")
+    raw_probes = _get_value(upload, "probes", []) or []
+    probes = []
+
+    for probe_idx, probe in enumerate(raw_probes, start=1):
         url = _get_value(probe, "url")
         size = _get_value(probe, "size")
         probe_timeout = _get_value(probe, "timeout")
@@ -145,6 +182,236 @@ async def _measure_upload_fallback_mbps(ya: YaSpeedTest) -> float:
             )
             continue
 
+        probes.append((probe_idx, url, size_int, probe_timeout))
+
+    return probes
+
+
+def _url_probes(ya: YaSpeedTest, probe_name: str) -> list[tuple[int, str, object]]:
+    """Return URL probes normalized to index, URL, and timeout."""
+    probe_group = _get_value(_get_value(ya, "probes"), probe_name)
+    raw_probes = _get_value(probe_group, "probes", []) or []
+    probes = []
+
+    for probe_idx, probe in enumerate(raw_probes, start=1):
+        url = _get_value(probe, "url")
+        probe_timeout = _get_value(probe, "timeout")
+        if not url:
+            _LOGGER.debug("Skipping %s probe #%d: empty url", probe_name, probe_idx)
+            continue
+        probes.append((probe_idx, url, probe_timeout))
+
+    return probes
+
+
+async def _post_browserlike_upload(
+    session: aiohttp.ClientSession,
+    url: str,
+    size: int,
+) -> int:
+    """POST one browser-like upload request and return uploaded bytes on success."""
+    async with session.post(_url_with_rid(url, _generate_rid()), data=b"\0" * size) as response:
+        await response.read()
+        return size if response.status == 200 else 0
+
+
+async def _measure_browserlike_upload_mbps(
+    ya: YaSpeedTest,
+    probes: list[tuple[int, str, int, object]],
+) -> float:
+    """Measure upload with many parallel short POSTs like Yandex Internetometer."""
+    if not probes:
+        return 0.0
+
+    semaphore = asyncio.Semaphore(UPLOAD_BROWSERLIKE_CONCURRENCY)
+    timeout_config = aiohttp.ClientTimeout(total=120, connect=10, sock_read=120)
+
+    async def upload_task(request_idx: int, session: aiohttp.ClientSession) -> int:
+        _, url, size, _ = probes[request_idx % len(probes)]
+        async with semaphore:
+            try:
+                return await _post_browserlike_upload(session, url, size)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug(
+                    "Browser-like upload request #%d failed: %s",
+                    request_idx + 1,
+                    err,
+                )
+                return 0
+
+    start = time.perf_counter()
+    async with aiohttp.ClientSession(headers=ya.DEFAULT_HEADERS, timeout=timeout_config) as session:
+        uploaded = await asyncio.gather(
+            *(upload_task(idx, session) for idx in range(UPLOAD_BROWSERLIKE_REQUESTS))
+        )
+    elapsed = time.perf_counter() - start
+
+    successful_requests = sum(1 for uploaded_bytes in uploaded if uploaded_bytes > 0)
+    success_ratio = successful_requests / UPLOAD_BROWSERLIKE_REQUESTS
+    if success_ratio < UPLOAD_BROWSERLIKE_MIN_SUCCESS_RATIO:
+        _LOGGER.warning(
+            "Browser-like upload fallback success ratio is too low: %.2f",
+            success_ratio,
+        )
+        return 0.0
+
+    uploaded_bytes = sum(uploaded)
+    if elapsed <= 0 or uploaded_bytes <= 0:
+        return 0.0
+
+    upload_mbps = (uploaded_bytes * 8) / elapsed / 1_000_000
+    _LOGGER.info(
+        "Browser-like upload fallback result: %.2f Mbit/s "
+        "(requests=%d successful=%d elapsed=%.3fs bytes=%d)",
+        upload_mbps,
+        UPLOAD_BROWSERLIKE_REQUESTS,
+        successful_requests,
+        elapsed,
+        uploaded_bytes,
+    )
+    return upload_mbps
+
+
+async def _get_browserlike_download(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> int:
+    """GET one browser-like download request and return downloaded bytes on success."""
+    async with session.get(_url_with_rid(url, _generate_rid())) as response:
+        if response.status != 200:
+            await response.read()
+            return 0
+        return len(await response.read())
+
+
+async def _measure_browserlike_download_mbps(ya: YaSpeedTest) -> float:
+    """Measure download with many parallel small GETs like Yandex Internetometer."""
+    probes = [
+        probe
+        for probe in _url_probes(ya, "download")
+        if "100kb" in probe[1]
+    ]
+    if not probes:
+        _LOGGER.debug("No 100kb download probes available for browser-like fallback")
+        return 0.0
+
+    semaphore = asyncio.Semaphore(DOWNLOAD_BROWSERLIKE_CONCURRENCY)
+    timeout_config = aiohttp.ClientTimeout(total=120, connect=10, sock_read=120)
+
+    async def download_task(request_idx: int, session: aiohttp.ClientSession) -> int:
+        _, url, _ = probes[request_idx % len(probes)]
+        async with semaphore:
+            try:
+                return await _get_browserlike_download(session, url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug(
+                    "Browser-like download request #%d failed: %s",
+                    request_idx + 1,
+                    err,
+                )
+                return 0
+
+    start = time.perf_counter()
+    async with aiohttp.ClientSession(headers=ya.DEFAULT_HEADERS, timeout=timeout_config) as session:
+        downloaded = await asyncio.gather(
+            *(download_task(idx, session) for idx in range(DOWNLOAD_BROWSERLIKE_REQUESTS))
+        )
+    elapsed = time.perf_counter() - start
+
+    successful_requests = sum(1 for downloaded_bytes in downloaded if downloaded_bytes > 0)
+    success_ratio = successful_requests / DOWNLOAD_BROWSERLIKE_REQUESTS
+    if success_ratio < DOWNLOAD_BROWSERLIKE_MIN_SUCCESS_RATIO:
+        _LOGGER.warning(
+            "Browser-like download success ratio is too low: %.2f",
+            success_ratio,
+        )
+        return 0.0
+
+    downloaded_bytes = sum(downloaded)
+    if elapsed <= 0 or downloaded_bytes <= 0:
+        return 0.0
+
+    download_mbps = (downloaded_bytes * 8) / elapsed / 1_000_000
+    _LOGGER.info(
+        "Browser-like download result: %.2f Mbit/s "
+        "(requests=%d successful=%d elapsed=%.3fs bytes=%d)",
+        download_mbps,
+        DOWNLOAD_BROWSERLIKE_REQUESTS,
+        successful_requests,
+        elapsed,
+        downloaded_bytes,
+    )
+    return download_mbps
+
+
+async def _get_browserlike_ping_ms(
+    session: aiohttp.ClientSession,
+    url: str,
+) -> float | None:
+    """GET one browser-like ping request and return elapsed milliseconds."""
+    start = time.perf_counter()
+    async with session.get(_url_with_rid(url, _generate_rid())) as response:
+        await response.read()
+        if response.status != 200:
+            return None
+    return (time.perf_counter() - start) * 1000
+
+
+async def _measure_browserlike_ping_ms(ya: YaSpeedTest) -> float:
+    """Measure latency with many small GETs like Yandex Internetometer."""
+    probes = _url_probes(ya, "latency")
+    if not probes:
+        return 0.0
+
+    semaphore = asyncio.Semaphore(PING_BROWSERLIKE_CONCURRENCY)
+    timeout_config = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+
+    async def ping_task(request_idx: int, session: aiohttp.ClientSession) -> float | None:
+        _, url, _ = probes[request_idx % len(probes)]
+        async with semaphore:
+            try:
+                return await _get_browserlike_ping_ms(session, url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                _LOGGER.debug(
+                    "Browser-like ping request #%d failed: %s",
+                    request_idx + 1,
+                    err,
+                )
+                return None
+
+    async with aiohttp.ClientSession(headers=ya.DEFAULT_HEADERS, timeout=timeout_config) as session:
+        results = await asyncio.gather(
+            *(ping_task(idx, session) for idx in range(PING_BROWSERLIKE_REQUESTS))
+        )
+
+    successful_results = [result for result in results if result is not None]
+    success_ratio = len(successful_results) / PING_BROWSERLIKE_REQUESTS
+    if success_ratio < PING_BROWSERLIKE_MIN_SUCCESS_RATIO:
+        _LOGGER.warning("Browser-like ping success ratio is too low: %.2f", success_ratio)
+        return 0.0
+
+    ping_ms = statistics.median(successful_results)
+    _LOGGER.info(
+        "Browser-like ping result: %.2f ms (requests=%d successful=%d)",
+        ping_ms,
+        PING_BROWSERLIKE_REQUESTS,
+        len(successful_results),
+    )
+    return ping_ms
+
+
+async def _measure_upload_fallback_mbps(ya: YaSpeedTest) -> float:
+    """Measure upload directly from available upload probes."""
+    probes = _upload_probes(ya)
+    best_upload_mbps = 0.0
+
+    for probe_idx, url, size_int, probe_timeout in probes:
         try:
             raw_upload_mbps = await ya.measure_upload_peak(url, size_int, probe_timeout)
         except asyncio.CancelledError:
@@ -162,7 +429,21 @@ async def _measure_upload_fallback_mbps(ya: YaSpeedTest) -> float:
             f"upload_fallback_probe_{probe_idx}",
         )
 
-        if upload_mbps == 0 and hasattr(ya, "measure_upload"):
+        _LOGGER.debug(
+            "Upload fallback probe #%d result: %.2f Mbit/s",
+            probe_idx,
+            upload_mbps,
+        )
+        best_upload_mbps = max(best_upload_mbps, upload_mbps)
+
+    if best_upload_mbps == 0:
+        best_upload_mbps = max(
+            best_upload_mbps,
+            await _measure_browserlike_upload_mbps(ya, probes),
+        )
+
+    if hasattr(ya, "measure_upload"):
+        for probe_idx, url, size_int, probe_timeout in probes:
             classic_size = max(size_int, UPLOAD_CLASSIC_FALLBACK_SIZE)
             _LOGGER.debug(
                 "Running classic upload fallback probe #%d: probe_size=%d classic_size=%d",
@@ -196,13 +477,7 @@ async def _measure_upload_fallback_mbps(ya: YaSpeedTest) -> float:
                         probe_idx,
                         upload_mbps,
                     )
-
-        _LOGGER.debug(
-            "Upload fallback probe #%d result: %.2f Mbit/s",
-            probe_idx,
-            upload_mbps,
-        )
-        best_upload_mbps = max(best_upload_mbps, upload_mbps)
+                    best_upload_mbps = max(best_upload_mbps, upload_mbps)
 
     if best_upload_mbps > 0:
         _LOGGER.info(
@@ -365,6 +640,14 @@ class YaInternetometrDataUpdateCoordinator(DataUpdateCoordinator):
                     upload_mbps = _extract_upload_mbps(result)
                     download_mbps = _extract_download_mbps(result)
                     ping_ms = _extract_ping_ms(result)
+
+                    browserlike_ping_ms = await _measure_browserlike_ping_ms(ya)
+                    if browserlike_ping_ms > 0:
+                        ping_ms = browserlike_ping_ms
+
+                    browserlike_download_mbps = await _measure_browserlike_download_mbps(ya)
+                    if browserlike_download_mbps > 0:
+                        download_mbps = max(download_mbps, browserlike_download_mbps)
 
                     if upload_mbps == 0 and download_mbps > 1:
                         _LOGGER.warning(
